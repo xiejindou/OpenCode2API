@@ -335,6 +335,10 @@ export function createApp(config) {
         INTERNAL_ALLOWED_TOOLS = [],
         INTERNAL_TOOL_METRICS_ENABLED = true,
         INTERNAL_TOOL_DISCOVERY_FIXTURE = [],
+        HEALTH_DETAILS_ENABLED = true,
+        HEALTH_DETAILS_REQUIRE_AUTH = true,
+        METRICS_ENABLED = false,
+        METRICS_REQUIRE_AUTH = true,
         PROMPT_MODE,
         OMIT_SYSTEM_PROMPT,
         AUTO_CLEANUP_CONVERSATIONS,
@@ -355,9 +359,19 @@ export function createApp(config) {
     const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
     const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
 
+    const isOperationalEndpointBypassed = (req) => {
+        if (req.path === '/health/details') {
+            return HEALTH_DETAILS_ENABLED && !HEALTH_DETAILS_REQUIRE_AUTH;
+        }
+        if (req.path === '/metrics') {
+            return METRICS_ENABLED && !METRICS_REQUIRE_AUTH;
+        }
+        return false;
+    };
+
     // Auth middleware
     app.use((req, res, next) => {
-        if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/') return next();
+        if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
         if (API_KEY && API_KEY.trim() !== '') {
             const authHeader = req.headers.authorization;
             if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
@@ -602,6 +616,10 @@ export function createApp(config) {
             );
         }
 
+        const deniedRequestedTools = requestInternalAllowlist
+            ? requestInternalAllowlist.filter(name => !SERVER_INTERNAL_ALLOWED_TOOL_NAMES.includes(name))
+            : [];
+
         const mode = resolveToolMode(tools, effectiveInternalAllowlist);
         const external = mode === TOOL_MODE.EXTERNAL_BRIDGE
             ? createExternalToolContext(tools, toolChoice)
@@ -618,6 +636,23 @@ export function createApp(config) {
             internal: {
                 allowedToolNames: effectiveInternalAllowlist,
                 requestedAllowlist: requestInternalAllowlist,
+                deniedRequestedTools,
+                resolutionPath: requestInternalAllowlist ? 'request-intersection' : 'server-default',
+                resultingMode: mode,
+                metricsEnabled: INTERNAL_TOOL_METRICS_ENABLED
+            }
+        };
+
+
+        return {
+            mode,
+            external,
+            internal: {
+                allowedToolNames: effectiveInternalAllowlist,
+                requestedAllowlist: requestInternalAllowlist,
+                deniedRequestedTools,
+                resolutionPath: requestInternalAllowlist ? 'request-intersection' : 'server-default',
+                resultingMode: mode,
                 metricsEnabled: INTERNAL_TOOL_METRICS_ENABLED
             }
         };
@@ -1232,11 +1267,15 @@ export function createApp(config) {
                     const externalToolRegistry = externalToolContext.registry;
                     const externalToolChoice = externalToolContext.toolChoice;
                     const internalToolContext = requestToolContext.internal;
-                    trackToolMode(toolMode, {
-                        configuredAllowlist: internalToolContext.allowedToolNames,
-                        requestedAllowlist: internalToolContext.requestedAllowlist,
-                        route: '/v1/chat/completions'
-                    });
+            trackToolMode(toolMode, {
+                configuredAllowlist: internalToolContext.allowedToolNames,
+                requestedAllowlist: internalToolContext.requestedAllowlist,
+                deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                resolutionPath: internalToolContext.resolutionPath,
+                resultingMode: internalToolContext.resultingMode,
+                route: '/v1/chat/completions'
+            });
+
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
                     const systemWithGuard = buildSystemPrompt(
                         [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
@@ -1257,7 +1296,10 @@ export function createApp(config) {
                         disableTools: DISABLE_TOOLS,
                         toolMode,
                         internalAllowedTools: internalToolContext.allowedToolNames,
-                        requestedInternalTools: internalToolContext.requestedAllowlist
+                        requestedInternalTools: internalToolContext.requestedAllowlist,
+                        deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                        resolutionPath: internalToolContext.resolutionPath,
+                        resultingMode: internalToolContext.resultingMode
                     });
 
                     // Ensure backend is running
@@ -1699,12 +1741,32 @@ export function createApp(config) {
         }
     });
 
+    const hasValidBearerAuth = (req) => {
+        if (!API_KEY || API_KEY.trim() === '') return true;
+        const authHeader = req.headers.authorization;
+        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
+    };
+
+    const shouldAllowOperationalEndpoint = (req, { enabled, requireAuth }) => {
+        if (!enabled) return false;
+        if (!requireAuth) return true;
+        return hasValidBearerAuth(req);
+    };
+
     app.get('/health', (_req, res) => res.json({
         status: 'ok',
         proxy: true
     }));
 
-    app.get('/health/details', (_req, res) => {
+    app.get('/health/details', (req, res) => {
+        if (!shouldAllowOperationalEndpoint(req, {
+            enabled: HEALTH_DETAILS_ENABLED,
+            requireAuth: HEALTH_DETAILS_REQUIRE_AUTH
+        })) {
+            return res.status(HEALTH_DETAILS_ENABLED ? 401 : 404).json({
+                error: { message: HEALTH_DETAILS_ENABLED ? 'Unauthorized' : 'Not found' }
+            });
+        }
         const metricsSnapshot = INTERNAL_TOOL_METRICS_ENABLED ? { ...internalToolMetrics } : null;
         res.json({
             status: 'ok',
@@ -1720,9 +1782,48 @@ export function createApp(config) {
                     tool_ids_cached: !!cachedToolIds,
                     tool_id_count: cachedToolIds ? cachedToolIds.length : 0,
                     age_ms: cachedToolIdsAt ? Date.now() - cachedToolIdsAt : null
+                },
+                audit: {
+                    available: true,
+                    fields: [
+                        'requestedAllowlist',
+                        'allowedToolNames',
+                        'deniedRequestedTools',
+                        'resolutionPath',
+                        'resultingMode'
+                    ]
                 }
             }
         });
+    });
+
+    app.get('/metrics', (req, res) => {
+        if (!shouldAllowOperationalEndpoint(req, {
+            enabled: METRICS_ENABLED,
+            requireAuth: METRICS_REQUIRE_AUTH
+        })) {
+            return res.status(METRICS_ENABLED ? 401 : 404).send(METRICS_ENABLED ? 'Unauthorized' : 'Not found');
+        }
+
+        const metricsLines = [
+            '# HELP opencode_internal_tool_mode_requests_total Count of internal tool mode selections by mode.',
+            '# TYPE opencode_internal_tool_mode_requests_total counter',
+            `opencode_internal_tool_mode_requests_total{mode="external_bridge"} ${internalToolMetrics.externalBridgeRequests}`,
+            `opencode_internal_tool_mode_requests_total{mode="internal_allowlist"} ${internalToolMetrics.internalAllowlistRequests}`,
+            `opencode_internal_tool_mode_requests_total{mode="disabled"} ${internalToolMetrics.disabledRequests}`,
+            '# HELP opencode_internal_tool_discovery_failures_total Count of backend tool discovery failures.',
+            '# TYPE opencode_internal_tool_discovery_failures_total counter',
+            `opencode_internal_tool_discovery_failures_total ${internalToolMetrics.discoveryFailures}`,
+            '# HELP opencode_internal_tool_fallback_disabled_total Count of allowlist resolutions that fell back to disabled.',
+            '# TYPE opencode_internal_tool_fallback_disabled_total counter',
+            `opencode_internal_tool_fallback_disabled_total ${internalToolMetrics.fallbackToDisabled}`,
+            '# HELP opencode_internal_tool_cache_ids Number of cached backend tool IDs.',
+            '# TYPE opencode_internal_tool_cache_ids gauge',
+            `opencode_internal_tool_cache_ids ${cachedToolIds ? cachedToolIds.length : 0}`
+        ];
+
+        res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+        res.send(`${metricsLines.join('\n')}\n`);
     });
 
     app.post('/v1/responses', async (req, res) => {
@@ -1755,6 +1856,9 @@ export function createApp(config) {
             trackToolMode(toolMode, {
                 configuredAllowlist: internalToolContext.allowedToolNames,
                 requestedAllowlist: internalToolContext.requestedAllowlist,
+                deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                resolutionPath: internalToolContext.resolutionPath,
+                resultingMode: internalToolContext.resultingMode,
                 route: '/v1/responses'
             });
             logDebug('Responses API request', { 
@@ -1764,7 +1868,10 @@ export function createApp(config) {
                 max_output_tokens,
                 toolMode,
                 internalAllowedTools: internalToolContext.allowedToolNames,
-                requestedInternalTools: internalToolContext.requestedAllowlist
+                requestedInternalTools: internalToolContext.requestedAllowlist,
+                deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                resolutionPath: internalToolContext.resolutionPath,
+                resultingMode: internalToolContext.resultingMode
             });
             const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
@@ -2091,7 +2198,10 @@ export function createApp(config) {
                     const parsedDeltaToolCalls = isReasoning
                         ? parseReasoningToolCalls(delta)
                         : parseContentToolCalls(delta);
-                    parsedDeltaToolCalls.forEach((toolCall) => emitResponsesFunctionCall(toolCall));
+                    if (parsedDeltaToolCalls.length > 0) {
+                        const { validCalls: allowedDeltaToolCalls } = finalizeValidatedToolCalls(parsedDeltaToolCalls, externalToolRegistry);
+                        allowedDeltaToolCalls.forEach((toolCall) => emitResponsesFunctionCall(toolCall));
+                    }
                     const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                     if (!filtered) return;
                     if (isReasoning) {
@@ -2657,6 +2767,18 @@ export function startProxy(options) {
             : typeof process.env.OPENCODE_TOOL_DISCOVERY_FIXTURE === 'string'
                 ? process.env.OPENCODE_TOOL_DISCOVERY_FIXTURE.split(',').map(entry => entry.trim()).filter(Boolean)
                 : [],
+        HEALTH_DETAILS_ENABLED: normalizeBool(options.HEALTH_DETAILS_ENABLED) ??
+            normalizeBool(process.env.OPENCODE_HEALTH_DETAILS_ENABLED) ??
+            true,
+        HEALTH_DETAILS_REQUIRE_AUTH: normalizeBool(options.HEALTH_DETAILS_REQUIRE_AUTH) ??
+            normalizeBool(process.env.OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH) ??
+            true,
+        METRICS_ENABLED: normalizeBool(options.METRICS_ENABLED) ??
+            normalizeBool(process.env.OPENCODE_METRICS_ENABLED) ??
+            false,
+        METRICS_REQUIRE_AUTH: normalizeBool(options.METRICS_REQUIRE_AUTH) ??
+            normalizeBool(process.env.OPENCODE_METRICS_REQUIRE_AUTH) ??
+            true,
         DEBUG: String(options.DEBUG || '').toLowerCase() === 'true' ||
             options.DEBUG === '1' ||
             String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
