@@ -5,6 +5,10 @@ TEST_PORT="${TEST_PORT:-14096}"
 CONTAINER_NAME="opencode2api-test-${TEST_PORT}"
 INTERNAL_ALLOWED_TOOLS="${INTERNAL_ALLOWED_TOOLS:-web_fetch,filesystem}"
 TOOL_DISCOVERY_FIXTURE="${TOOL_DISCOVERY_FIXTURE:-web_fetch,filesystem,bash}"
+HEALTH_DETAILS_ENABLED="${HEALTH_DETAILS_ENABLED:-true}"
+HEALTH_DETAILS_REQUIRE_AUTH="${HEALTH_DETAILS_REQUIRE_AUTH:-true}"
+METRICS_ENABLED="${METRICS_ENABLED:-true}"
+METRICS_REQUIRE_AUTH="${METRICS_REQUIRE_AUTH:-true}"
 
 cleanup() {
     docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -24,6 +28,10 @@ docker run -d --name "${CONTAINER_NAME}" \
     -e API_KEY=test-key \
     -e OPENCODE_INTERNAL_ALLOWED_TOOLS="${INTERNAL_ALLOWED_TOOLS}" \
     -e OPENCODE_TOOL_DISCOVERY_FIXTURE="${TOOL_DISCOVERY_FIXTURE}" \
+    -e OPENCODE_HEALTH_DETAILS_ENABLED="${HEALTH_DETAILS_ENABLED}" \
+    -e OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH="${HEALTH_DETAILS_REQUIRE_AUTH}" \
+    -e OPENCODE_METRICS_ENABLED="${METRICS_ENABLED}" \
+    -e OPENCODE_METRICS_REQUIRE_AUTH="${METRICS_REQUIRE_AUTH}" \
     opencode2api:test
 
 echo "Waiting for service to be ready..."
@@ -56,6 +64,21 @@ curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
 
 echo "Testing health details endpoint..."
 curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details > /dev/null || { echo "/health/details check failed"; exit 1; }
+
+echo "Testing metrics endpoint..."
+curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/metrics | grep -q "opencode_internal_tool_mode_requests_total" || { echo "/metrics check failed"; exit 1; }
+
+echo "Testing health details auth gating..."
+if curl -sf http://localhost:${TEST_PORT}/health/details > /dev/null; then
+    echo "/health/details unexpectedly allowed without auth"
+    exit 1
+fi
+
+echo "Testing metrics auth gating..."
+if curl -sf http://localhost:${TEST_PORT}/metrics > /dev/null; then
+    echo "/metrics unexpectedly allowed without auth"
+    exit 1
+fi
 
 echo "Testing Case 1: Full allowlist match"
 curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
@@ -106,3 +129,4 @@ if [ "$DISABLED_REQS" -lt 1 ]; then
 fi
 
 echo "--- Integration Tests Passed! ---"
+
