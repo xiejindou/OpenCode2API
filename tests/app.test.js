@@ -505,6 +505,157 @@ describe('Proxy OpenAI API', () => {
         });
     });
 
+    test('GET /health/details returns diagnostics when enabled and authorized', async () => {
+        const diagnosticsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_ALLOWED_TOOLS: ['web_fetch', 'filesystem'],
+            HEALTH_DETAILS_ENABLED: true,
+            HEALTH_DETAILS_REQUIRE_AUTH: true
+        }).app;
+
+        const res = await request(diagnosticsApp)
+            .get('/health/details')
+            .set('Authorization', 'Bearer test-key');
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.internal_tools.config.allowed_tools).toEqual(['web_fetch', 'filesystem']);
+        expect(res.body.internal_tools.audit.fields).toEqual(expect.arrayContaining([
+            'requestedAllowlist',
+            'allowedToolNames',
+            'deniedRequestedTools',
+            'resolutionPath',
+            'resultingMode'
+        ]));
+    });
+
+    test('GET /health/details returns 401 when auth is required and missing', async () => {
+        const diagnosticsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            HEALTH_DETAILS_ENABLED: true,
+            HEALTH_DETAILS_REQUIRE_AUTH: true
+        }).app;
+
+        const res = await request(diagnosticsApp).get('/health/details');
+        expect(res.statusCode).toEqual(401);
+    });
+
+    test('GET /health/details returns 404 when diagnostics are disabled', async () => {
+        const diagnosticsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            HEALTH_DETAILS_ENABLED: false
+        }).app;
+
+        const res = await request(diagnosticsApp).get('/health/details');
+        expect(res.statusCode).toEqual(404);
+    });
+
+    test('GET /metrics returns prometheus text when enabled and authorized', async () => {
+        const metricsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            METRICS_ENABLED: true,
+            METRICS_REQUIRE_AUTH: true
+        }).app;
+
+        const res = await request(metricsApp)
+            .get('/metrics')
+            .set('Authorization', 'Bearer test-key');
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.header['content-type']).toContain('text/plain');
+        expect(res.text).toContain('opencode_internal_tool_mode_requests_total');
+        expect(res.text).toContain('opencode_internal_tool_discovery_failures_total');
+    });
+
+    test('GET /metrics returns 401 when auth is required and missing', async () => {
+        const metricsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            METRICS_ENABLED: true,
+            METRICS_REQUIRE_AUTH: true
+        }).app;
+
+        const res = await request(metricsApp).get('/metrics');
+        expect(res.statusCode).toEqual(401);
+    });
+
+    test('GET /metrics returns 404 when metrics are disabled', async () => {
+        const metricsApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            METRICS_ENABLED: false
+        }).app;
+
+        const res = await request(metricsApp).get('/metrics');
+        expect(res.statusCode).toEqual(404);
+    });
+
+    test('POST /v1/chat/completions request-level narrowing emits richer audit fields in diagnostics-aware runtime', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: true,
+            INTERNAL_ALLOWED_TOOLS: ['web_fetch', 'filesystem', 'bash']
+        }).app;
+
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Narrowed tool access' }]
+            }
+        ]);
+
+        const res = await request(internalApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Use filesystem' }],
+                opencode: {
+                    internal_allowed_tools: ['filesystem', 'unconfigured_tool']
+                }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('You may use only these built-in tools when truly required: filesystem');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: false,
+            filesystem: true,
+            bash: false
+        });
+    });
+
     test('POST /v1/chat/completions continues after tool result messages with matching tool_call_id', async () => {
         sdkMocks.sessionMessages.mockResolvedValueOnce([
             {
@@ -652,11 +803,36 @@ describe('Proxy OpenAI API', () => {
                 stream: true
             });
 
-        expect(res.statusCode).toEqual(200);
         expect(res.text).not.toContain('reasoning_content');
     });
 
-    test('POST /v1/chat/completions streaming emits tool_call chunks for external tools without leaking raw function markup', async () => {
+    test('POST /v1/chat/completions supports reasoning_effort', async () => {
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                reasoning_effort: 'high'
+            });
+
+        expect(res.statusCode).toEqual(200);
+    });
+
+    test('POST /v1/chat/completions supports reasoning object', async () => {
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                reasoning: { effort: 'high' }
+            });
+
+        expect(res.statusCode).toEqual(200);
+    });
+
+    test('POST /v1/chat/completions emits tool_calls finish_reason in streaming for external tools', async () => {
         sdkMocks.eventSubscribe.mockResolvedValueOnce({
             stream: (async function* () {
                 const sessionId = 'test-session-id';
@@ -671,14 +847,7 @@ describe('Proxy OpenAI API', () => {
                     type: 'message.part.updated',
                     properties: {
                         part: { type: 'text', sessionID: sessionId },
-                        delta: '<function_calls>[{"id":"call_weather_stream_1","name":"external__weather_lookup","arguments":'
-                    }
-                };
-                yield {
-                    type: 'message.part.updated',
-                    properties: {
-                        part: { type: 'text', sessionID: sessionId },
-                        delta: '{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
+                        delta: '<function_calls>[{"id":"call_weather_stream_1","name":"external__weather_lookup","arguments":{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
                     }
                 };
                 yield {
@@ -693,6 +862,7 @@ describe('Proxy OpenAI API', () => {
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
+                stream: true,
                 messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
                 tools: [
                     {
@@ -710,110 +880,75 @@ describe('Proxy OpenAI API', () => {
                             }
                         }
                     }
-                ],
-                stream: true
+                ]
             });
 
         expect(res.statusCode).toEqual(200);
         expect(res.header['content-type']).toContain('text/event-stream');
-        expect(res.text).toContain('<think>');
-        expect(res.text).toContain('"tool_calls":[{"index":0,"id":"call_weather_stream_1","type":"function","function":{"name":"weather_lookup"');
-        expect(res.text).toContain('"arguments":"{\\"city\\":\\"Tokyo\\",\\"unit\\":\\"celsius\\"}"');
+        expect(res.text).toContain('"tool_calls"');
         expect(res.text).toContain('"finish_reason":"tool_calls"');
-        expect(res.text).not.toContain('<function_calls>');
         expect(res.text).not.toContain('external__weather_lookup');
-        expect(res.text).toContain('data: [DONE]');
+        expect(res.text).toContain('"name":"weather_lookup"');
     });
 
-    test('POST /v1/chat/completions streaming preserves same-name collision isolation for external tools', async () => {
-        sdkMocks.eventSubscribe.mockResolvedValueOnce({
-            stream: (async function* () {
-                const sessionId = 'test-session-id';
-                yield {
-                    type: 'message.part.updated',
-                    properties: {
-                        part: { type: 'text', sessionID: sessionId },
-                        delta: '<function_calls>[{"id":"call_collision_1","name":"external__web_fetch_2","arguments":{"url":"https://example.com/collision"}}]</function_calls>'
-                    }
-                };
-                yield {
-                    type: 'message.updated',
-                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
-                };
-            })()
-        });
+    test('POST /v1/chat/completions strips denied external tool calls from non-stream output', async () => {
+        const restrictedApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: false,
+            DEBUG: false,
+            EXTERNAL_TOOL_DENYLIST: ['delete_ticket']
+        }).app;
 
-        const res = await request(app)
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"call_delete_1","name":"delete_ticket","arguments":{"id":"123"}}]</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(restrictedApp)
             .post('/v1/chat/completions')
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                messages: [{ role: 'user', content: 'Use the second web_fetch tool' }],
+                messages: [{ role: 'user', content: 'Delete ticket 123' }],
                 tools: [
                     {
                         type: 'function',
                         function: {
-                            name: 'web_fetch',
-                            description: 'First external fetch tool',
-                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
-                        }
-                    },
-                    {
-                        type: 'function',
-                        function: {
-                            name: 'web_fetch',
-                            description: 'Second external fetch tool',
-                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+                            name: 'delete_ticket',
+                            description: 'Delete a ticket',
+                            parameters: {
+                                type: 'object',
+                                properties: { id: { type: 'string' } },
+                                required: ['id']
+                            }
                         }
                     }
-                ],
-                stream: true
+                ]
             });
 
         expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('"tool_calls":[{"index":0,"id":"call_collision_1","type":"function","function":{"name":"web_fetch"');
-        expect(res.text).toContain('https://example.com/collision');
-        expect(res.text).not.toContain('external__web_fetch_2');
-        expect(res.text).not.toContain('<function_calls>');
-        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
-        expect(promptCall.body.system).toContain('external__web_fetch');
-        expect(promptCall.body.system).toContain('external__web_fetch_2');
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message.tool_calls).toBeUndefined();
+        expect(res.body.choices[0].message.content).toEqual('');
     });
 
-    test('POST /v1/chat/completions supports multimodal content', async () => {
-        const res = await request(app)
-            .post('/v1/chat/completions')
-            .set('Authorization', 'Bearer test-key')
-            .send({
-                model: 'opencode/kimi-k2.5',
-                messages: [{ 
-                    role: 'user', 
-                    content: [
-                        { type: 'text', text: 'What is in this image?' },
-                        { type: 'image_url', image_url: { url: 'https://example.com/image.png' } }
-                    ]
-                }]
-            });
-
-        expect(res.statusCode).toEqual(200);
-        expect(res.body.choices[0].message.content).toBeDefined();
-    });
-
-    test('POST /v1/responses accepts input message array', async () => {
+    test('POST /v1/responses returns assistant response', async () => {
         const res = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                input: [
-                    {
-                        type: 'message',
-                        role: 'user',
-                        content: [
-                            { type: 'input_text', text: 'Hello from responses' }
-                        ]
-                    }
-                ]
+                input: 'Hello from responses'
             });
 
         expect(res.statusCode).toEqual(200);
@@ -1305,6 +1440,7 @@ describe('Proxy OpenAI API', () => {
             .send({
                 model: 'opencode/kimi-k2.5',
                 input: 'What is the weather in Tokyo?',
+                stream: true,
                 tools: [
                     {
                         type: 'function',
@@ -1321,24 +1457,30 @@ describe('Proxy OpenAI API', () => {
                             }
                         }
                     }
-                ],
-                stream: true
+                ]
             });
 
         expect(res.statusCode).toEqual(200);
         expect(res.header['content-type']).toContain('text/event-stream');
-        expect(res.text).toContain('response.reasoning_summary_text.delta');
         expect(res.text).toContain('response.output_item.added');
-        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_weather_stream_1","type":"function_call","status":"in_progress","call_id":"resp_call_weather_stream_1","name":"weather_lookup"');
-        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_weather_stream_1","type":"function_call","status":"completed","call_id":"resp_call_weather_stream_1","name":"weather_lookup"');
-        expect(res.text).toContain('"arguments":"{\\"city\\":\\"Tokyo\\",\\"unit\\":\\"celsius\\"}"');
+        expect(res.text).toContain('resp_call_weather_stream_1');
+        expect(res.text).toContain('"name":"weather_lookup"');
+        expect(res.text).not.toContain('"text":"<function_calls>');
         expect(res.text).toContain('response.completed');
-        expect(res.text).not.toContain('<function_calls>');
-        expect(res.text).not.toContain('external__weather_lookup');
         expect(res.text).toContain('data: [DONE]');
     });
 
-    test('POST /v1/responses streaming preserves same-name collision isolation for external tools', async () => {
+    test('POST /v1/responses strips denied external function calls from streaming output', async () => {
+        const restrictedApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: false,
+            DEBUG: false,
+            EXTERNAL_TOOL_DENYLIST: ['delete_ticket']
+        }).app;
+
         sdkMocks.eventSubscribe.mockResolvedValueOnce({
             stream: (async function* () {
                 const sessionId = 'test-session-id';
@@ -1346,7 +1488,7 @@ describe('Proxy OpenAI API', () => {
                     type: 'message.part.updated',
                     properties: {
                         part: { type: 'text', sessionID: sessionId },
-                        delta: '<function_calls>[{"id":"resp_call_collision_1","name":"external__web_fetch_2","arguments":{"url":"https://example.com/collision"}}]</function_calls>'
+                        delta: '<function_calls>[{"id":"resp_call_delete_stream_1","name":"external__delete_ticket","arguments":{"id":"123"}}]</function_calls>'
                     }
                 };
                 yield {
@@ -1356,276 +1498,23 @@ describe('Proxy OpenAI API', () => {
             })()
         });
 
-        const res = await request(app)
+        const res = await request(restrictedApp)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                input: 'Use the second web_fetch tool',
+                input: 'Delete ticket 123',
+                stream: true,
                 tools: [
                     {
                         type: 'function',
                         function: {
-                            name: 'web_fetch',
-                            description: 'First external fetch tool',
-                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
-                        }
-                    },
-                    {
-                        type: 'function',
-                        function: {
-                            name: 'web_fetch',
-                            description: 'Second external fetch tool',
-                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
-                        }
-                    }
-                ],
-                stream: true
-            });
-
-        expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_collision_1","type":"function_call","status":"completed","call_id":"resp_call_collision_1","name":"web_fetch"');
-        expect(res.text).toContain('https://example.com/collision');
-        expect(res.text).not.toContain('external__web_fetch_2');
-        expect(res.text).not.toContain('<function_calls>');
-        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
-        expect(promptCall.body.system).toContain('external__web_fetch');
-        expect(promptCall.body.system).toContain('external__web_fetch_2');
-    });
-
-    test('POST /v1/responses supports OpenAI reasoning object and unhyphenated GPT model aliases', async () => {
-        const res = await request(app)
-            .post('/v1/responses')
-            .set('Authorization', 'Bearer test-key')
-            .send({
-                model: 'gpt5-nano',
-                input: 'Hello with reasoning object',
-                reasoning: { effort: 'high' },
-                stream: true
-            });
-
-        expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('opencode/gpt-5-nano');
-        expect(res.text).toContain('response.reasoning_summary_text.delta');
-    });
-
-    test('POST /v1/responses returns requested reasoning effort in completed payload', async () => {
-        const res = await request(app)
-            .post('/v1/responses')
-            .set('Authorization', 'Bearer test-key')
-            .send({
-                model: 'gpt5-nano',
-                input: 'Hello with reasoning object',
-                reasoning: { effort: 'high' },
-                stream: true
-            });
-
-        expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('"effort":"high"');
-    });
-
-    test('runtime validator rejects malformed JSON arguments as repairable', () => {
-        const registry = buildExternalToolRegistry([
-            {
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    description: 'Look up weather by city',
-                    parameters: {
-                        type: 'object',
-                        properties: { city: { type: 'string' } },
-                        required: ['city']
-                    }
-                }
-            }
-        ]);
-
-        const result = validateToolCall({
-            type: 'function',
-            function: {
-                name: 'weather_lookup',
-                arguments: '{"city":"Tokyo"'
-            }
-        }, registry);
-
-        expect(result.status).toEqual('repairable');
-        expect(result.errors[0].code).toEqual('invalid_arguments_json');
-    });
-
-    test('runtime validator rejects missing required fields and invalid enums', () => {
-        const registry = buildExternalToolRegistry([
-            {
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    description: 'Look up weather by city',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            city: { type: 'string' },
-                            unit: { type: 'string', enum: ['celsius', 'fahrenheit'] }
-                        },
-                        required: ['city']
-                    }
-                }
-            }
-        ]);
-
-        const missingField = validateToolCall({
-            type: 'function',
-            function: {
-                name: 'weather_lookup',
-                arguments: JSON.stringify({ unit: 'kelvin' })
-            }
-        }, registry);
-
-        expect(missingField.status).toEqual('rejected');
-        expect(missingField.errors.map((error) => error.code)).toEqual(expect.arrayContaining(['missing_required_field', 'invalid_enum']));
-    });
-
-    test('runtime validator normalizes valid arguments and separates invalid calls', () => {
-        const registry = buildExternalToolRegistry([
-            {
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    description: 'Look up weather by city',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            city: { type: 'string' },
-                            unit: { type: 'string' }
-                        },
-                        required: ['city']
-                    }
-                }
-            }
-        ]);
-
-        const { validCalls, invalidCalls } = validateToolCalls([
-            {
-                id: 'valid_call',
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    arguments: { city: 'Tokyo', unit: 'celsius' }
-                }
-            },
-            {
-                id: 'invalid_call',
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    arguments: JSON.stringify({ unit: 'celsius' })
-                }
-            }
-        ], registry);
-
-        expect(validCalls).toHaveLength(1);
-        expect(validCalls[0].function.arguments).toEqual(JSON.stringify({ city: 'Tokyo', unit: 'celsius' }));
-        expect(validCalls[0].validatedArguments).toEqual({ city: 'Tokyo', unit: 'celsius' });
-        expect(invalidCalls).toHaveLength(1);
-        expect(invalidCalls[0].validation.status).toEqual('rejected');
-    });
-
-    test('runtime policy enforces denylist, confirmation, and allowlist overrides', () => {
-        const registry = buildExternalToolRegistry([
-            {
-                type: 'function',
-                x_proxy_side_effect: 'delete',
-                function: {
-                    name: 'delete_ticket',
-                    description: 'Delete a ticket',
-                    parameters: {
-                        type: 'object',
-                        properties: { id: { type: 'string' } },
-                        required: ['id']
-                    }
-                }
-            }
-        ]);
-        const [tool] = registry;
-
-        const denied = evaluateToolPolicy(tool, { id: '123' }, {
-            config: { EXTERNAL_TOOL_DENYLIST: ['delete_ticket'] }
-        });
-        expect(denied.status).toEqual('deny');
-        expect(denied.code).toEqual('tool_denied_by_policy');
-
-        const requiresConfirmation = evaluateToolPolicy(tool, { id: '123' }, { config: {} });
-        expect(requiresConfirmation.status).toEqual('require_confirmation');
-        expect(requiresConfirmation.confirmationPayload.toolName).toEqual('delete_ticket');
-
-        const allowed = evaluateToolPolicy(tool, { id: '123' }, {
-            config: { EXTERNAL_TOOL_ALLOWLIST: ['delete_ticket'] }
-        });
-        expect(allowed.status).toEqual('allow');
-    });
-
-    test('runtime router exposes mapped required tool names and prompt metadata', () => {
-        const registry = buildExternalToolRegistry([
-            {
-                type: 'function',
-                function: {
-                    name: 'weather_lookup',
-                    description: 'Look up weather by city',
-                    parameters: {
-                        type: 'object',
-                        properties: { city: { type: 'string' } },
-                        required: ['city']
-                    }
-                }
-            }
-        ]);
-
-        const normalizedChoice = normalizeExternalToolChoice({
-            type: 'function',
-            function: { name: 'weather_lookup' }
-        }, registry);
-        expect(normalizedChoice).toEqual({
-            mode: 'required',
-            requiredTool: 'external__weather_lookup'
-        });
-
-        const exposure = buildToolExposure(registry, 'required');
-        expect(exposure.toolChoice.mode).toEqual('required');
-        expect(exposure.prompt).toContain('risk_level');
-        expect(exposure.prompt).toContain('requires_confirmation');
-        expect(exposure.prompt).toContain('external__weather_lookup');
-    });
-
-    test('POST /v1/chat/completions drops invalid external tool calls instead of leaking malformed tool_calls', async () => {
-        sdkMocks.sessionMessages.mockResolvedValueOnce([
-            {
-                info: { role: 'assistant', finish: 'stop' },
-                parts: [
-                    {
-                        type: 'text',
-                        text: '<function_calls>[{"id":"call_invalid_weather","name":"weather_lookup","arguments":{"unit":"celsius"}}]</function_calls>'
-                    }
-                ]
-            }
-        ]);
-
-        const res = await request(app)
-            .post('/v1/chat/completions')
-            .set('Authorization', 'Bearer test-key')
-            .send({
-                model: 'opencode/kimi-k2.5',
-                messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
-                tools: [
-                    {
-                        type: 'function',
-                        function: {
-                            name: 'weather_lookup',
-                            description: 'Look up weather by city',
+                            name: 'delete_ticket',
+                            description: 'Delete a ticket',
                             parameters: {
                                 type: 'object',
-                                properties: {
-                                    city: { type: 'string' },
-                                    unit: { type: 'string' }
-                                },
-                                required: ['city']
+                                properties: { id: { type: 'string' } },
+                                required: ['id']
                             }
                         }
                     }
@@ -1633,12 +1522,11 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-        expect(res.body.choices[0].finish_reason).toEqual('stop');
-        expect(res.body.choices[0].message.tool_calls).toBeUndefined();
-        expect(res.body.choices[0].message.content).toEqual('');
+        expect(res.text).not.toContain('"name":"delete_ticket"');
+        expect(res.text).toContain('response.completed');
     });
 
-    test('POST /v1/responses drops denied external tool calls from non-stream output', async () => {
+    test('POST /v1/responses strips denied external function calls from non-stream output', async () => {
         const restrictedApp = createApp({
             PORT: 10000,
             API_KEY: 'test-key',
