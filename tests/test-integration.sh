@@ -54,11 +54,55 @@ curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}" | grep -q "chat.completion" || { echo "Chat completion failed"; exit 1; }
 
-echo "Checking startup logs for tool discovery fixture..."
-LOGS=$(docker logs "${CONTAINER_NAME}" 2>&1)
-echo "$LOGS" | grep -q "Internal Allowed Tools" || { echo "Internal allowlist log missing"; exit 1; }
-echo "$LOGS" | grep -q "web_fetch, filesystem" || { echo "Internal allowlist values missing"; exit 1; }
-echo "$LOGS" | grep -q "Internal Tool Discovery Fixture" || { echo "Tool discovery fixture log missing"; exit 1; }
-echo "$LOGS" | grep -q "web_fetch, filesystem, bash" || { echo "Tool discovery fixture values missing"; exit 1; }
+echo "Testing health details endpoint..."
+curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details > /dev/null || { echo "/health/details check failed"; exit 1; }
+
+echo "Testing Case 1: Full allowlist match"
+curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
+    -H "Authorization: Bearer test-key" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"Use web_fetch\"}]}" > /dev/null
+METRICS_JSON=$(curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details)
+ALLOWLIST_REQS=$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["internal_tools"]["metrics"]["internalAllowlistRequests"])' <<< "$METRICS_JSON")
+if [ "$ALLOWLIST_REQS" -lt 1 ]; then
+    echo "Case 1 failed: internalAllowlistRequests did not increment. Metrics: $METRICS_JSON"
+    exit 1
+fi
+
+echo "Testing Case 2: External tools priority"
+curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
+    -H "Authorization: Bearer test-key" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"Use external tool\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"test_tool\",\"description\":\"desc\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]}" > /dev/null
+METRICS_JSON=$(curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details)
+BRIDGE_REQS=$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["internal_tools"]["metrics"]["externalBridgeRequests"])' <<< "$METRICS_JSON")
+if [ "$BRIDGE_REQS" -lt 1 ]; then
+    echo "Case 2 failed: externalBridgeRequests did not increment. Metrics: $METRICS_JSON"
+    exit 1
+fi
+
+echo "Testing Case 3: Partial match"
+curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
+    -H "Authorization: Bearer test-key" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"Use unconfigured tool\"}],\"opencode\":{\"internal_allowed_tools\":[\"filesystem\",\"unconfigured_tool\"]}}" > /dev/null
+METRICS_JSON=$(curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details)
+ALLOWLIST_REQS=$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["internal_tools"]["metrics"]["internalAllowlistRequests"])' <<< "$METRICS_JSON")
+if [ "$ALLOWLIST_REQS" -lt 2 ]; then
+    echo "Case 3 failed: internalAllowlistRequests did not increment. Metrics: $METRICS_JSON"
+    exit 1
+fi
+
+echo "Testing Case 4: No match / Disabled"
+curl -sf -X POST http://localhost:${TEST_PORT}/v1/chat/completions \
+    -H "Authorization: Bearer test-key" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"Use unconfigured tool\"}],\"opencode\":{\"internal_allowed_tools\":[\"unconfigured_tool\"]}}" > /dev/null
+METRICS_JSON=$(curl -sf -H "Authorization: Bearer test-key" http://localhost:${TEST_PORT}/health/details)
+DISABLED_REQS=$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["internal_tools"]["metrics"]["disabledRequests"])' <<< "$METRICS_JSON")
+if [ "$DISABLED_REQS" -lt 1 ]; then
+    echo "Case 4 failed: disabledRequests did not increment. Metrics: $METRICS_JSON"
+    exit 1
+fi
 
 echo "--- Integration Tests Passed! ---"
