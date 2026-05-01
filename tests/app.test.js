@@ -138,6 +138,24 @@ describe('Proxy OpenAI API', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         sdkMocks.toolIds.mockResolvedValue({ data: ['web_fetch', 'filesystem', 'bash'] });
+        sdkMocks.sessionPrompt.mockImplementation(async (args) => {
+            const promptText = args.body.prompt || args.body.parts?.map(part => part.text || '').join(' ') || '';
+            const parts = [{ type: 'text', text: 'Mock response' }];
+
+            if (promptText.includes('reasoning')) {
+                parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
+            }
+
+            return { data: { parts } };
+        });
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'text', text: 'Mock response' }
+                ]
+            }
+        ]));
         const config = {
             PORT: 10000,
             API_KEY: 'test-key',
@@ -403,6 +421,86 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
         expect(promptCall.body.tools).toEqual({
+            bash: false
+        });
+    });
+
+    test('POST /v1/chat/completions applies request-level allowlist narrowing (intersection)', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_ALLOWED_TOOLS: ['web_fetch', 'filesystem', 'bash']
+        }).app;
+
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Narrowed tool access' }]
+            }
+        ]);
+
+        const res = await request(internalApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Use filesystem' }],
+                opencode: {
+                    internal_allowed_tools: ['filesystem', 'unconfigured_tool']
+                }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('You may use only these built-in tools when truly required: filesystem');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: false,
+            filesystem: true,
+            bash: false
+        });
+    });
+
+    test('POST /v1/chat/completions ignores request-level allowlist when external tools are present', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_ALLOWED_TOOLS: ['filesystem']
+        }).app;
+
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'External bridge active' }]
+            }
+        ]);
+
+        const res = await request(internalApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Use external tool' }],
+                tools: [{ type: 'function', function: { name: 'external_fetch', description: 'test' } }],
+                opencode: {
+                    internal_allowed_tools: ['filesystem']
+                }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('External tools are virtualized by this proxy');
+        expect(promptCall.body.system).not.toContain('You may use only these built-in tools');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: false,
+            filesystem: false,
             bash: false
         });
     });
@@ -976,6 +1074,84 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
         expect(promptCall.body.tools).toEqual({
+            bash: false
+        });
+    });
+
+    test('POST /v1/responses applies request-level allowlist narrowing (intersection)', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_ALLOWED_TOOLS: ['web_fetch', 'filesystem', 'bash']
+        }).app;
+
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [{ type: 'text', text: 'Narrowed tool access' }]
+            }
+        });
+
+        const res = await request(internalApp)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Use filesystem',
+                opencode: {
+                    internal_allowed_tools: ['filesystem', 'unconfigured_tool']
+                }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('You may use only these built-in tools when truly required: filesystem');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: false,
+            filesystem: true,
+            bash: false
+        });
+    });
+
+    test('POST /v1/responses ignores request-level allowlist when external tools are present', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_ALLOWED_TOOLS: ['filesystem']
+        }).app;
+
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [{ type: 'text', text: 'External bridge active' }]
+            }
+        });
+
+        const res = await request(internalApp)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Use external tool',
+                tools: [{ type: 'function', function: { name: 'external_fetch', description: 'test' } }],
+                opencode: {
+                    internal_allowed_tools: ['filesystem']
+                }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('External tools are virtualized by this proxy');
+        expect(promptCall.body.system).not.toContain('You may use only these built-in tools');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: false,
+            filesystem: false,
             bash: false
         });
     });
