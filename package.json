@@ -8,7 +8,8 @@
     "start": "node index.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand --detectOpenHandles",
     "test:unit": "npm test",
-    "test:integration": "bash tests/test-integration.sh"
+    "test:integration": "bash tests/test-integration.sh",
+    "pm2:start": "pm2 start index.js --name opencode2api"
   },
   "keywords": [
     "opencode",

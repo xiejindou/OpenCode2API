@@ -1,7 +1,7 @@
 # OpenCode2API
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/Node.js-18+-orange" alt="Node">
 </p>
@@ -19,9 +19,9 @@
 | 🟢 **OpenAI 兼容** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
 | 📡 **流式输出** | Chat Completions 与 Responses API 的完整 SSE 流式支持 |
 | 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
+| 🔧 **外部工具调用（完整兼容）** | 客户端按标准 OpenAI `tools` 格式传入，代理自动桥接，返回标准 `tool_calls`，无需任何兼容代码 |
+| 🛡️ **工具安全** | 默认禁用 OpenCode 内置工具，外部工具命名空间隔离防冲突 |
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
-| 🛡️ **工具安全** | 默认禁用工具调用 |
-| 🔧 **外部工具桥接** | 支持外部客户端传入 `tools`，由代理桥接为 OpenAI-compatible `tool_calls` / `function_call`，避免命中 OpenCode 内置工具 |
 | 🌐 **内置 web_fetch 透传** | 当请求未传入 `tools` 且显式开启特性时，仅允许 OpenCode 内置 `web_fetch` 参与该次请求 |
 
 ---
@@ -46,8 +46,6 @@ docker compose up -d
 curl http://127.0.0.1:10000/health
 ```
 
-> 默认 `docker-compose.yml` 不会把宿主机项目目录挂载到容器内，因为那会覆盖镜像里已安装的 `node_modules`，导致容器依赖宿主机先执行 `npm install`。如果你需要本地源码热更新，建议单独使用开发专用的 Compose 覆盖配置。
-
 ### Node.js (本地开发)
 
 ```bash
@@ -62,6 +60,138 @@ npm install
 cp config.json.example config.json
 npm start
 ```
+
+---
+
+## 🔧 外部工具调用
+
+OpenCode2API 对外部工具调用做了完整的兼容处理，客户端只需按标准 OpenAI API 格式传入 `tools`，即可获得标准的 `tool_calls` 返回，**无需任何适配代码**。
+
+### 工作原理
+
+```
+客户端 (LangChain / OpenAI SDK / curl)
+    │  传入标准 OpenAI tools 格式
+    ▼
+OpenCode2API 代理层
+    │  1. 注册外部工具，加命名空间前缀 (external__)
+    │  2. 注入提示词引导模型输出 <function_calls> 格式
+    │  3. 模型输出后，解析并转换为标准 tool_calls
+    │  4. 若模型未正确输出工具调用，智能重试一次
+    ▼
+客户端收到标准 OpenAI tool_calls 响应
+```
+
+### 兼容性保障
+
+| 保障项 | 说明 |
+|:-------|:-----|
+| **标准格式** | 客户端传入标准 OpenAI `tools`，收到标准 `tool_calls`，完全兼容 OpenAI SDK |
+| **解析容错** | 支持 `<function_calls>` 标签格式、裸 JSON 格式、markdown 代码块包裹、多行格式化、嵌套 arguments |
+| **智能重试** | auto 模式下检测到模型"想调用但格式不对"时自动重试；required 模式下始终强制重试 |
+| **命名空间隔离** | 外部工具自动加 `external__` 前缀，与 OpenCode 内置工具隔离，同名不冲突 |
+| **推理内容过滤** | 模型的 `<think/>` 推理内容不会泄露到客户端响应中 |
+
+### Python 示例 (LangChain)
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+
+def get_weather(city: str) -> str:
+    """获取指定城市的天气"""
+    # ... 实际实现 ...
+    return f"{city}当前天气：晴，气温26°C"
+
+llm = ChatOpenAI(
+    base_url="http://127.0.0.1:10000/v1",
+    model="opencode/deepseek-v4-flash-free",
+    api_key="your-api-key",
+    temperature=0.2,
+)
+
+agent = create_agent(
+    model=llm,
+    tools=[get_weather],
+    system_prompt="你是一个天气助手，请用中文回答。",
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "深圳今天天气怎么样？"}]}
+)
+print(result)
+```
+
+### Python 示例 (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:10000/v1",
+    api_key="your-api-key",
+)
+
+response = client.chat.completions.create(
+    model="opencode/deepseek-v4-flash-free",
+    messages=[{"role": "user", "content": "深圳今天天气怎么样？"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "获取指定城市的天气",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名称"}
+                },
+                "required": ["city"]
+            }
+        }
+    }]
+)
+
+if response.choices[0].message.tool_calls:
+    for tc in response.choices[0].message.tool_calls:
+        print(f"工具: {tc.function.name}, 参数: {tc.function.arguments}")
+```
+
+### curl 示例
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "messages": [{"role": "user", "content": "深圳今天天气怎么样？"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "获取指定城市的天气",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {"type": "string", "description": "城市名称"}
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+### tool_choice 支持
+
+| 值 | 行为 |
+|:---|:-----|
+| `"auto"` (默认) | 模型自行决定是否调用工具；若模型输出了工具调用痕迹但格式不对，代理会智能重试一次 |
+| `"required"` | 强制模型必须调用工具；若首次未成功，代理会强制重试 |
+| `"none"` | 禁用工具调用 |
+| `{"type": "function", "function": {"name": "xxx"}}` | 强制调用指定工具 |
 
 ---
 
@@ -91,34 +221,6 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
     "input": "用一句话打招呼",
     "reasoning": {"effort": "high"},
     "stream": true
-  }'
-```
-
-### Chat Completions + 外部工具
-
-```bash
-curl -X POST http://127.0.0.1:10000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "opencode/big-pickle",
-    "messages": [{"role": "user", "content": "帮我获取 https://example.com 的标题"}],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "web_fetch",
-          "description": "Fetch a URL and return its content summary",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "url": {"type": "string"}
-            },
-            "required": ["url"]
-          }
-        }
-      }
-    ]
   }'
 ```
 
@@ -173,7 +275,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
 | `API_KEY` | - | Bearer Token 认证密钥 |
 | `BIND_HOST` | `0.0.0.0` | 绑定地址 |
-| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
+| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 内置工具 |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具与 OpenCode 内置工具的冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；当未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
@@ -219,20 +321,22 @@ OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 ```
 
-
 ### 外部工具桥接说明
 
-- 外部客户端传入的 `tools` 不会被注册为 OpenCode 内置工具。
-- 代理会把这些工具虚拟化后交给模型使用，并把模型输出重新整理为 OpenAI-compatible `tool_calls` / `function_call`。
-- 同名冲突默认通过内部命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 容器内工具。
+- 外部客户端传入的 `tools` 按 OpenAI 标准格式传入，代理自动桥接处理，客户端无需任何适配代码。
+- 代理会把外部工具虚拟化后交给模型使用，并把模型输出转换为标准 OpenAI `tool_calls` 格式返回。
+- 代理内置多层解析容错：支持 `<function_calls>` 标签、裸 JSON、markdown 代码块、多行格式化、嵌套 arguments。
+- 当模型未正确输出工具调用时，代理会智能判断是否需要重试（auto 模式下检测工具调用痕迹，required 模式下始终重试）。
+- 同名冲突通过命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 内置工具。
 - 内部命名空间名（如 `external__web_fetch`）是代理内部实现细节，不属于公开 API。
+- 模型的推理内容（`<think/>` 块）不会泄露到客户端响应中。
 
 ### 内置工具 allowlist 说明
 
 - 当请求 **未传入** `tools` 时，代理会进入 internal allowlist 模式，并只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 中声明的 OpenCode 内置工具。
 - `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 仅作为兼容旧配置的快捷方式：当未显式配置 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 时，会默认把 allowlist 视为 `web_fetch`。
 - 代理会读取后端工具列表，并通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
-- 如果配置的 allowlist 在后端工具列表中一个也匹配不到，代理会自动回退到“全部内置工具禁用”的安全模式。
+- 如果配置的 allowlist 在后端工具列表中一个也匹配不到，代理会自动回退到"全部内置工具禁用"的安全模式。
 - `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时，代理会输出 internal allowlist 模式的调试/指标日志，包括模式选择、后端工具发现、allowlist 命中结果和降级原因，但不会记录工具返回内容。
 - `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可用于集成测试或本地调试，绕过真实 `client.tool.ids()` 返回固定工具 ID 列表。
 - 一旦客户端显式传入 `tools`，请求立即回到现有外部工具桥接逻辑，OpenCode 内置工具继续保持禁用。
@@ -279,6 +383,12 @@ USE_ISOLATED_HOME=false  # 让 OpenCode 复用本地登录态
 ### 模型找不到
 - 查看可用模型: `curl http://127.0.0.1:10000/v1/models`
 - 确认模型 ID 完全匹配
+
+### 工具调用不生效
+- 确认 `DISABLE_TOOLS=true` 和 `OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge` 已配置
+- 确认传入的 `tools` 符合 OpenAI 标准格式
+- 开启调试: `OPENCODE_PROXY_DEBUG=true`，查看代理日志中的工具解析情况
+- 部分免费模型对工具调用的支持可能不稳定，可尝试 `tool_choice: "required"` 强制调用
 
 ### 没有推理输出
 - 使用 `stream: true` 的 Responses API

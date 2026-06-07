@@ -694,6 +694,26 @@ export function createApp(config) {
         }));
     };
 
+    /**
+     * 判断模型输出是否"看起来像是想调用工具但格式不对"。
+     * 用于 auto 模式下决定是否触发强制重试。
+     * 如果模型输出了正常的文本回答（没有工具相关的痕迹），则不重试。
+     */
+    const looksLikeFailedToolCall = (reasoning, content, registry) => {
+        const text = `${reasoning || ''} ${content || ''}`.toLowerCase();
+        // 检查是否包含工具名相关的内容
+        const hasToolNameMention = registry.some((tool) =>
+            text.includes(tool.namespacedName.toLowerCase()) ||
+            text.includes(tool.originalName.toLowerCase())
+        );
+        // 检查是否包含工具调用相关的关键词
+        const hasToolCallKeywords = text.includes('function_call') ||
+            text.includes('tool_call') ||
+            text.includes('arguments') ||
+            /\{\s*"name"\s*:/.test(text);
+        return hasToolNameMention || hasToolCallKeywords;
+    };
+
     const createForcedToolCallRequester = ({
         mode,
         sessionId,
@@ -705,7 +725,7 @@ export function createApp(config) {
         requestTimeoutMs,
         forbidThinkBlock = false
     }) => async () => {
-        if (mode !== 'required') return null;
+        if (mode === 'none') return null;
         if (!requiredTool) return null;
         const forcedPromptParams = {
             path: { id: sessionId },
@@ -1422,35 +1442,12 @@ export function createApp(config) {
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
                             if (isReasoning) {
-                                if (!insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '<think>\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                    insideReasoning = true;
-                                }
+                                // 不再向客户端输出推理内容
+                                insideReasoning = true;
                                 streamedReasoning += filtered;
                                 reasoningTokens += Math.ceil(filtered.length / 4);
                             } else {
                                 if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '\n</think>\n\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
                                     insideReasoning = false;
                                 }
                                 streamedContent += filtered;
@@ -1555,7 +1552,7 @@ export function createApp(config) {
                             : (externalToolRegistry.length > 0
                                 ? parseExternalToolCallsFromText(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
                                 : []);
-                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0 && (externalToolChoice.mode === 'required' || looksLikeFailedToolCall(rawStreamedReasoning, rawStreamedContent, externalToolRegistry))) {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
                                 parsedToolCalls = parseExternalToolCallsFromText(
@@ -1625,7 +1622,7 @@ export function createApp(config) {
                         let parsedToolCalls = externalToolRegistry.length > 0
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                             : [];
-                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0 && (externalToolChoice.mode === 'required' || looksLikeFailedToolCall(reasoning, content, externalToolRegistry))) {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
                                 content = forcedResponse.content || content;
@@ -1642,10 +1639,7 @@ export function createApp(config) {
                         const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        let finalContent = safeContent;
-                        if (safeReasoning) {
-                            finalContent = `<think>\n${safeReasoning}\n</think>\n\n${safeContent}`;
-                        }
+                        const finalContent = safeContent;
 
                         const publicValidatedToolCalls = toPublicToolCalls(validatedToolCalls);
                         const assistantMessage = publicValidatedToolCalls.length > 0
@@ -2340,7 +2334,7 @@ export function createApp(config) {
                             polledForToolCalls?.content || rawContent
                         )
                         : []);
-                if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0 && (externalToolChoice.mode === 'required' || looksLikeFailedToolCall(polledForToolCalls?.reasoning || rawReasoning, polledForToolCalls?.content || rawContent, externalToolRegistry))) {
                     const forcedResponse = await requestForcedResponsesToolCall();
                     if (forcedResponse) {
                         parsedToolCalls = parseExternalToolCallsFromText(
@@ -2425,7 +2419,7 @@ export function createApp(config) {
                 : (externalToolRegistry.length > 0
                     ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                     : []);
-            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+            if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0 && (externalToolChoice.mode === 'required' || looksLikeFailedToolCall(reasoning, content, externalToolRegistry))) {
                 const forcedResponse = await requestForcedResponsesToolCall();
                 if (forcedResponse) {
                     content = forcedResponse.content || content;

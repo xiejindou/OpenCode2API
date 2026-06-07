@@ -38,13 +38,16 @@ export function buildExternalToolsPrompt(registry, toolChoice = null) {
 
   return [
     'External tools are virtualized by this proxy. They are not OpenCode tools.',
-    'When you need an external tool, your entire assistant reply MUST be ONLY one or more <function_calls>...</function_calls> blocks.',
-    'Do NOT output <think>, explanations, markdown, prose, or any text before or after <function_calls> blocks when making a tool call.',
-    'Each block must contain JSON with this exact shape:',
-    '{"name":"external__tool_name","arguments":{}}',
-    'Arguments must be a valid JSON object that matches the declared schema.',
-    'Use only the namespaced names listed below. Do not use original client tool names inside function calls.',
-    'If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
+    'When you need to call an external tool, your ENTIRE reply MUST be ONLY <function_calls>...</function_calls> blocks.',
+    'Format: <function_calls>{"name":"external__tool_name","arguments":{}}</function_calls>',
+    'Rules:',
+    '- You MUST wrap every tool call inside <function_calls>...</function_calls> tags. Do NOT output bare JSON.',
+    '- Do NOT output thinking, explanations, markdown, prose, or any text before or after <function_calls> blocks when making a tool call.',
+    '- Arguments must be a valid JSON object matching the declared schema.',
+    '- Use ONLY the namespaced names listed below (e.g. external__tool_name). Do NOT use original client tool names.',
+    '- When a user request matches an available tool, prefer calling the tool over answering from general knowledge.',
+    '- When a user request does NOT match any available tool, answer directly without calling tools.',
+    '- If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
     ...choiceInstructions,
     `Available external tools: ${JSON.stringify(registry.map((tool) => ({
       name: tool.namespacedName,
